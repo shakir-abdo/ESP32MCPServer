@@ -1,4 +1,6 @@
 #include "NetworkManager.h"
+#include "DiscoveryManager.h"
+#include "BusHistory.h"
 #include <esp_random.h>
 #include <ArduinoJson.h>
 
@@ -9,6 +11,14 @@ NetworkManager::NetworkManager()
       ws("/ws"),
       connectAttempts(0),
       lastConnectAttempt(0) {
+}
+
+void NetworkManager::setDiscoveryManager(DiscoveryManager* dm) {
+    discovery_ = dm;
+}
+
+void NetworkManager::setBusHistory(mcp::BusHistory* bh) {
+    busHistory_ = bh;
 }
 
 void NetworkManager::begin() {
@@ -25,6 +35,7 @@ void NetworkManager::begin() {
        if (static_cast<system_event_id_t>(event) == SYSTEM_EVENT_STA_DISCONNECTED) {
             if (state == NetworkState::CONNECTED) {
                 state = NetworkState::CONNECTION_FAILED;
+                if (discovery_) discovery_->onNetworkDisconnected();
                 queueRequest(NetworkRequest::Type::CHECK_CONNECTION);
             }
         }
@@ -68,6 +79,39 @@ void NetworkManager::setupWebServer() {
     
     server.on("/status", HTTP_GET, [this](AsyncWebServerRequest *request) {
         this->handleStatus(request);
+    });
+
+    server.on("/app", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (LittleFS.exists("/app.html")) {
+            request->send(LittleFS, "/app.html", "text/html");
+        } else {
+            request->send(404, "text/plain", "Dashboard not found in filesystem");
+        }
+    });
+
+    server.on("/discovery", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        this->handleDiscoveryGet(request);
+    });
+
+    server.on("/discovery", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        this->handleDiscoveryPost(request);
+    });
+
+    server.on("/bus-history", HTTP_GET, [this](AsyncWebServerRequest *request) {
+        this->handleBusHistoryGet(request);
+    });
+
+    server.on("/bus-history", HTTP_POST, [this](AsyncWebServerRequest *request) {
+        this->handleBusHistoryPost(request);
+    });
+
+    // Serve the bus history config UI page from LittleFS.
+    server.on("/bus-history-config", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (LittleFS.exists("/bus_history_config.html")) {
+            request->send(LittleFS, "/bus_history_config.html", "text/html");
+        } else {
+            request->send(404, "text/plain", "Bus history config page not found");
+        }
     });
 
     server.begin();
@@ -188,6 +232,7 @@ void NetworkManager::checkConnection() {
             state = NetworkState::CONNECTED;
             connectAttempts = 0;
             ws.textAll(getNetworkStatusJson(state, getSSID(), getIPAddress()));
+            if (discovery_) discovery_->onNetworkConnected(getIPAddress());
         } else if (millis() - lastConnectAttempt >= CONNECT_TIMEOUT) {
             state = NetworkState::CONNECTION_FAILED;
             queueRequest(NetworkRequest::Type::CONNECT);
@@ -212,6 +257,7 @@ void NetworkManager::startAP() {
     
     WiFi.softAP(apSSID.c_str());
     ws.textAll(getNetworkStatusJson(state, apSSID, WiFi.softAPIP().toString()));
+    if (discovery_) discovery_->onNetworkConnected(WiFi.softAPIP().toString());
 }
 
 String NetworkManager::generateUniqueSSID() {
@@ -303,4 +349,91 @@ void NetworkManager::queueRequest(NetworkRequest::Type type, const String &messa
     if (!requestQueue.push({type, message})) {
         Serial.println("Request queue is full!");
     }
+}
+
+void NetworkManager::handleClient() {
+    NetworkRequest request;
+    if (requestQueue.pop(request)) {
+        handleRequest(request);
+    }
+}
+
+void NetworkManager::handleDiscoveryGet(AsyncWebServerRequest *request) {
+    if (!discovery_) {
+        request->send(503, "application/json", "{\"error\":\"Discovery not configured\"}");
+        return;
+    }
+    DiscoveryConfig cfg = discovery_->getConfig();
+    JsonDocument doc;
+    doc["hostname"]          = cfg.hostname;
+    doc["fqdn"]              = String(cfg.hostname) + ".local";
+    doc["ip"]                = getIPAddress();
+    doc["mcpPort"]           = cfg.mcpPort;
+    doc["httpPort"]          = cfg.httpPort;
+    doc["broadcastInterval"] = cfg.broadcastInterval;
+    doc["broadcastPort"]     = cfg.broadcastPort;
+    doc["mdnsActive"]        = discovery_->isMdnsActive();
+    String json;
+    serializeJson(doc, json);
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    response->print(json);
+    request->send(response);
+}
+
+void NetworkManager::handleDiscoveryPost(AsyncWebServerRequest *request) {
+    if (!discovery_) {
+        request->send(503, "application/json", "{\"error\":\"Discovery not configured\"}");
+        return;
+    }
+    if (request->hasParam("hostname", true)) {
+        String h = request->getParam("hostname", true)->value();
+        if (!h.isEmpty()) discovery_->setHostname(h);
+    }
+    if (request->hasParam("broadcastInterval", true)) {
+        String bStr = request->getParam("broadcastInterval", true)->value();
+        discovery_->setBroadcastInterval((uint32_t)bStr.toInt());
+    }
+    handleDiscoveryGet(request);
+}
+
+// ---------------------------------------------------------------------------
+// /bus-history  GET — return current config + allocated sizes + free heap
+// /bus-history  POST — update config (form params), persist, reallocate
+// ---------------------------------------------------------------------------
+
+void NetworkManager::handleBusHistoryGet(AsyncWebServerRequest *request) {
+    if (!busHistory_) {
+        request->send(503, "application/json",
+                      "{\"error\":\"Bus history not configured\"}");
+        return;
+    }
+    std::string json = busHistory_->configToJson();
+    AsyncResponseStream *resp = request->beginResponseStream("application/json");
+    resp->print(json.c_str());
+    request->send(resp);
+}
+
+void NetworkManager::handleBusHistoryPost(AsyncWebServerRequest *request) {
+    if (!busHistory_) {
+        request->send(503, "application/json",
+                      "{\"error\":\"Bus history not configured\"}");
+        return;
+    }
+    mcp::BusHistoryConfig cfg = busHistory_->getConfig();
+
+    auto applyUint = [&](const char* key, uint32_t& field) {
+        if (request->hasParam(key, true)) {
+            field = (uint32_t)request->getParam(key, true)->value().toInt();
+        }
+    };
+    applyUint("canFrameCount",     cfg.canFrameCount);
+    applyUint("nmeaLineCount",     cfg.nmeaLineCount);
+    applyUint("nmea2000Count",     cfg.nmea2000Count);
+    applyUint("obdiiCount",        cfg.obdiiCount);
+    applyUint("ramBudgetBytes",    cfg.ramBudgetBytes);
+    applyUint("safetyMarginBytes", cfg.safetyMarginBytes);
+
+    busHistory_->setConfig(cfg); // persist, reallocate, announces via callback
+
+    handleBusHistoryGet(request); // return updated status
 }
